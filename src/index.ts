@@ -20,6 +20,10 @@ export { serialize, deserialize, newWorkersWebSocketRpcResponse, newHttpBatchRpc
          nodeHttpBatchRpcResponse };
 export type { RpcTransport, RpcSessionOptions, RpcCompatible };
 
+// Validation decorator
+export { validate, ValidationError, getValidationSchema } from "./validate.js";
+export type { StandardSchemaV1, SchemaConfig } from "./validate.js";
+
 // Hack the type system to make RpcStub's types work nicely!
 /**
  * Represents a reference to a remote object, on which methods may be remotely invoked via RPC.

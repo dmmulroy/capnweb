@@ -1422,3 +1422,265 @@ describe("MessagePorts", () => {
         new Error("Peer closed MessagePort connection."));
   });
 });
+
+// =======================================================================================
+// @validate decorator tests
+
+import { validate, ValidationError, getValidationSchema, StandardSchemaV1 } from "../src/index.js";
+
+// Simple mock Standard Schema implementation for testing
+function createSchema<T>(
+  validator: (value: unknown) => { valid: true; value: T } | { valid: false; message: string }
+): StandardSchemaV1<unknown, T> {
+  return {
+    "~standard": {
+      version: 1,
+      vendor: "test",
+      validate(value: unknown): StandardSchemaV1.Result<T> {
+        const result = validator(value);
+        if (result.valid) {
+          return { value: result.value };
+        }
+        return { issues: [{ message: result.message }] };
+      },
+    },
+  };
+}
+
+const stringSchema = createSchema<string>((value) => {
+  if (typeof value === "string") {
+    return { valid: true, value };
+  }
+  return { valid: false, message: "Expected string" };
+});
+
+const positiveNumberSchema = createSchema<number>((value) => {
+  if (typeof value === "number" && value > 0) {
+    return { valid: true, value };
+  }
+  return { valid: false, message: "Expected positive number" };
+});
+
+describe("@validate decorator", () => {
+  describe("with array of schemas (one per arg)", () => {
+    class Api extends RpcTarget {
+      @validate([stringSchema, positiveNumberSchema])
+      async greet(name: string, age: number) {
+        return `Hello ${name}, you are ${age} years old`;
+      }
+    }
+
+    it("passes validation with valid args", async () => {
+      const api = new Api();
+      const result = await api.greet("Bob", 25);
+      expect(result).toBe("Hello Bob, you are 25 years old");
+    });
+
+    it("fails validation when first arg is invalid", async () => {
+      const api = new Api();
+      await expect((api as any).greet(123, 25)).rejects.toThrow(ValidationError);
+      await expect((api as any).greet(123, 25)).rejects.toThrow(/name/);
+    });
+
+    it("fails validation when second arg is invalid", async () => {
+      const api = new Api();
+      await expect(api.greet("Bob", -5)).rejects.toThrow(ValidationError);
+      await expect(api.greet("Bob", -5)).rejects.toThrow(/age/);
+    });
+
+    it("collects multiple validation errors", async () => {
+      const api = new Api();
+      try {
+        await (api as any).greet(123, -5);
+        expect.fail("Should have thrown");
+      } catch (e) {
+        expect(e).toBeInstanceOf(ValidationError);
+        const err = e as ValidationError;
+        expect(err.issues.length).toBe(2);
+      }
+    });
+  });
+
+  describe("over RPC", () => {
+    class ValidatedApi extends RpcTarget {
+      @validate([stringSchema, positiveNumberSchema])
+      async greet(name: string, age: number) {
+        return `Hello ${name}, you are ${age} years old`;
+      }
+    }
+
+    it("validation runs on server side", async () => {
+      await using harness = new TestHarness(new ValidatedApi());
+      const result = await harness.stub.greet("Dave", 35);
+      expect(result).toBe("Hello Dave, you are 35 years old");
+    });
+
+    it("validation errors are returned to client", async () => {
+      const clientTransport = new TestTransport("client");
+      const serverTransport = new TestTransport("server", clientTransport);
+      const client = new RpcSession<ValidatedApi>(clientTransport);
+      const _server = new RpcSession(serverTransport, new ValidatedApi());
+      const stub = client.getRemoteMain();
+
+      await expect(stub.greet("Dave", -1)).rejects.toThrow(/Validation failed/);
+    });
+  });
+
+  describe("getValidationSchema", () => {
+    class Api extends RpcTarget {
+      @validate([stringSchema])
+      async validated(name: string) {
+        return name;
+      }
+
+      notValidated() {
+        return "no validation";
+      }
+    }
+
+    it("returns schema for validated methods", () => {
+      const schema = getValidationSchema(Api.prototype, "validated");
+      expect(schema).toBeDefined();
+      expect(Array.isArray(schema)).toBe(true);
+    });
+
+    it("returns undefined for non-validated methods", () => {
+      const schema = getValidationSchema(Api.prototype, "notValidated");
+      expect(schema).toBeUndefined();
+    });
+  });
+
+  describe("edge cases", () => {
+    it("throws if schema array is empty", () => {
+      expect(() => {
+        class Api extends RpcTarget {
+          @validate([])
+          async foo() { return 1; }
+        }
+        return Api;
+      }).toThrow(/at least one schema/);
+    });
+
+    it("throws if schema is not a Standard Schema", async () => {
+      const invalidSchema = { notStandard: true };
+      class Api extends RpcTarget {
+        @validate([invalidSchema as any])
+        async foo(x: string) { return x; }
+      }
+      const api = new Api();
+      await expect(api.foo("test")).rejects.toThrow(/not a valid Standard Schema/);
+    });
+
+    it("validates undefined when fewer args than schemas", async () => {
+      class Api extends RpcTarget {
+        @validate([stringSchema, positiveNumberSchema])
+        async greet(name: string, age: number) {
+          return `${name} ${age}`;
+        }
+      }
+      const api = new Api();
+      // Missing second arg - should validate undefined against positiveNumberSchema
+      await expect((api as any).greet("Bob")).rejects.toThrow(ValidationError);
+    });
+
+    it("allows extra args beyond schema count", async () => {
+      class Api extends RpcTarget {
+        @validate([stringSchema])
+        async greet(name: string, ...extra: unknown[]) {
+          return name;
+        }
+      }
+      const api = new Api();
+      // Extra args are not validated (by design)
+      expect(await api.greet("Bob", 123, null)).toBe("Bob");
+    });
+  });
+
+});
+
+// =============================================================================
+// Standard Schema library integration tests
+// =============================================================================
+
+import { z } from "zod";
+import * as v from "valibot";
+import { type } from "arktype";
+import * as yup from "yup";
+
+describe("@validate with standard schema libraries", () => {
+  describe("zod", () => {
+    class ZodApi extends RpcTarget {
+      @validate([z.string().min(1), z.number().positive()])
+      async greet(name: string, age: number) {
+        return `Hello ${name}, age ${age}`;
+      }
+    }
+
+    it("passes valid args", async () => {
+      const api = new ZodApi();
+      expect(await api.greet("Alice", 30)).toBe("Hello Alice, age 30");
+    });
+
+    it("rejects invalid args", async () => {
+      const api = new ZodApi();
+      await expect(api.greet("", -5)).rejects.toThrow(ValidationError);
+    });
+  });
+
+  describe("valibot", () => {
+    class ValibotApi extends RpcTarget {
+      @validate([v.pipe(v.string(), v.minLength(1)), v.pipe(v.number(), v.minValue(1))])
+      async greet(name: string, age: number) {
+        return `Hello ${name}, age ${age}`;
+      }
+    }
+
+    it("passes valid args", async () => {
+      const api = new ValibotApi();
+      expect(await api.greet("Bob", 25)).toBe("Hello Bob, age 25");
+    });
+
+    it("rejects invalid args", async () => {
+      const api = new ValibotApi();
+      await expect(api.greet("", 0)).rejects.toThrow(ValidationError);
+    });
+  });
+
+  describe("arktype", () => {
+    class ArkTypeApi extends RpcTarget {
+      @validate([type("string > 0"), type("number > 0")])
+      async greet(name: string, age: number) {
+        return `Hello ${name}, age ${age}`;
+      }
+    }
+
+    it("passes valid args", async () => {
+      const api = new ArkTypeApi();
+      expect(await api.greet("Charlie", 40)).toBe("Hello Charlie, age 40");
+    });
+
+    it("rejects invalid args", async () => {
+      const api = new ArkTypeApi();
+      await expect(api.greet("", -10)).rejects.toThrow(ValidationError);
+    });
+  });
+
+  describe("yup", () => {
+    class YupApi extends RpcTarget {
+      @validate([yup.string().required().min(1), yup.number().required().positive()])
+      async greet(name: string, age: number) {
+        return `Hello ${name}, age ${age}`;
+      }
+    }
+
+    it("passes valid args", async () => {
+      const api = new YupApi();
+      expect(await api.greet("Dana", 35)).toBe("Hello Dana, age 35");
+    });
+
+    it("rejects invalid args", async () => {
+      const api = new YupApi();
+      await expect(api.greet("", -1)).rejects.toThrow(ValidationError);
+    });
+  });
+});
